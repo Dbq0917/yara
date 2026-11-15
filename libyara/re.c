@@ -1485,6 +1485,85 @@ static void _yr_re_fiber_kill_all(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Returns true if the literal sequence following a RE_REPEAT_ANY instruction
+// can match at some offset between min and max characters from input. This is
+// used to avoid creating one fiber per offset when the literal sequence is not
+// present in the range at all.
+//
+static bool _yr_re_repeat_any_has_literal_match(
+    const uint8_t* input,
+    int input_incr,
+    int character_size,
+    int min,
+    int max,
+    const uint8_t* code)
+{
+  uint8_t literals[YR_MAX_ATOM_LENGTH];
+  int literal_count = 0;
+  const uint8_t* literal_code = code;
+
+  while (literal_count < YR_MAX_ATOM_LENGTH &&
+         *literal_code == RE_OPCODE_LITERAL)
+  {
+    literals[literal_count++] = *(literal_code + 1);
+    literal_code += 2;
+  }
+
+  if (literal_count == 0)
+    return true;
+
+  const uint8_t* range_start;
+  const uint8_t* range_end;
+
+  if (input_incr > 0)
+  {
+    range_start = input + min * character_size;
+    range_end = input + max * character_size;
+  }
+  else
+  {
+    range_start = input - max * character_size;
+    range_end = input - min * character_size;
+  }
+
+  const uint8_t* search_input = range_start;
+  size_t search_length = range_end - range_start + 1;
+
+  while (search_length > 0)
+  {
+    const uint8_t* literal_input = memchr(
+        search_input, literals[0], search_length);
+
+    if (literal_input == NULL)
+      return false;
+
+    bool literal_matches = true;
+
+    for (int k = 1; k < literal_count; k++)
+    {
+      const uint8_t* next_input = literal_input + k * input_incr;
+
+      if (next_input < range_start || next_input > range_end)
+        break;
+
+      if (*next_input != literals[k])
+      {
+        literal_matches = false;
+        break;
+      }
+    }
+
+    if (literal_matches)
+      return true;
+
+    search_length -= literal_input - search_input + 1;
+    search_input = literal_input + 1;
+  }
+
+  return false;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // Executes a fiber until reaching an "matching" instruction. A "matching"
 // instruction is one that actually reads a byte from the input and performs
 // some matching. If the fiber reaches a split instruction, the new fiber is
@@ -1720,7 +1799,39 @@ static int _yr_re_fiber_sync(
       // this case let's initialize the counter to 0 and start looping.
 
       if (fiber->rc == -1)
+      {
         fiber->rc = 0;
+
+        const uint8_t* next_ip = fiber->ip + 1 + sizeof(RE_REPEAT_ANY_ARGS);
+
+        if (*next_ip == RE_OPCODE_LITERAL && !(flags & RE_FLAGS_NO_CASE))
+        {
+          size_t max_bytes = flags & RE_FLAGS_BACKWARDS
+                                 ? input_backwards_size
+                                 : input_forwards_size;
+
+          max_bytes = yr_min(max_bytes, YR_RE_SCAN_LIMIT);
+
+          int max_chars = ((int) max_bytes - bytes_matched) / character_size -
+                          1;
+
+          if (max_chars > repeat_any_args->max)
+            max_chars = repeat_any_args->max;
+
+          if (max_chars < repeat_any_args->min ||
+              !_yr_re_repeat_any_has_literal_match(
+                  input,
+                  input_incr,
+                  character_size,
+                  repeat_any_args->min,
+                  max_chars,
+                  next_ip))
+          {
+            fiber = _yr_re_fiber_kill(fiber_list, fiber_pool, fiber);
+            break;
+          }
+        }
+      }
 
       if (fiber->rc < repeat_any_args->min)
       {
@@ -2303,6 +2414,80 @@ static void _yr_re_fast_exec_destroy_position_list(
 }
 
 ////////////////////////////////////////////////////////////////////////////////
+// Inserts a position in the sorted position list, reusing an existing position
+// if the same input offset was already added for the current round.
+//
+static int _yr_re_fast_exec_insert_position(
+    RE_FAST_EXEC_POSITION** first,
+    RE_FAST_EXEC_POSITION** last,
+    RE_FAST_EXEC_POSITION_POOL* pool,
+    RE_FAST_EXEC_POSITION** insertion_point,
+    const uint8_t* input,
+    int round)
+{
+  RE_FAST_EXEC_POSITION* previous = *insertion_point;
+  RE_FAST_EXEC_POSITION* existing = NULL;
+  RE_FAST_EXEC_POSITION* new_position;
+
+  while (previous != NULL && previous->next != NULL &&
+         previous->next->input <= input)
+  {
+    previous = previous->next;
+  }
+
+  if (previous != NULL && previous->input == input)
+    existing = previous;
+  else if (previous != NULL && previous->next != NULL &&
+           previous->next->input == input)
+    existing = previous->next;
+  else if (previous == NULL && *first != NULL && (*first)->input == input)
+    existing = *first;
+
+  if (existing != NULL)
+  {
+    if (existing->round == round)
+    {
+      *insertion_point = existing;
+      return ERROR_SUCCESS;
+    }
+
+    previous = existing;
+  }
+
+  FAIL_ON_ERROR(_yr_re_fast_exec_position_create(pool, &new_position));
+
+  new_position->input = input;
+  new_position->round = round;
+  new_position->prev = previous;
+
+  if (previous == NULL)
+  {
+    new_position->next = *first;
+
+    if (*first != NULL)
+      (*first)->prev = new_position;
+    else
+      *last = new_position;
+
+    *first = new_position;
+  }
+  else
+  {
+    new_position->next = previous->next;
+    previous->next = new_position;
+
+    if (new_position->next != NULL)
+      new_position->next->prev = new_position;
+    else
+      *last = new_position;
+  }
+
+  *insertion_point = new_position;
+
+  return ERROR_SUCCESS;
+}
+
+////////////////////////////////////////////////////////////////////////////////
 // This function replaces yr_re_exec for regular expressions marked with flag
 // RE_FLAGS_FAST_REGEXP. These regular expressions are derived from hex strings
 // that don't contain alternatives, like for example:
@@ -2487,63 +2672,160 @@ int yr_re_fast_exec(
         // the newly created inputs will be inserted.
         RE_FAST_EXEC_POSITION* insertion_point = current;
 
-        for (int j = repeat_any_args->min + 1; j <= repeat_any_args->max; j++)
+        int max_j = repeat_any_args->max;
+
+        if (max_j >= max_bytes_matched - bytes_matched)
+          max_j = max_bytes_matched - bytes_matched - 1;
+
+        if (*next_opcode == RE_OPCODE_LITERAL &&
+            repeat_any_args->min + 1 <= max_j)
         {
-          // bytes_matched is the number of bytes matched so far, and j is the
-          // minimum number of bytes that are still pending to match. If these
-          // two numbers sum more than the maximum number of bytes that can be
-          // matched the loop can be aborted. The position that we were about
-          // to create can't lead to a match without exceeding
-          // max_bytes_matched.
-          if (bytes_matched + j >= max_bytes_matched)
-            break;
+          // The byte following the repeat must be a literal. Instead of
+          // creating a position for every offset in the range and discarding
+          // most of them in the next round, find the offsets where the literal
+          // actually occurs. This avoids an O(range) loop for every candidate.
+          uint8_t literals[YR_MAX_ATOM_LENGTH];
+          int literal_count = 0;
+          const uint8_t* literal_code = next_opcode;
+          const uint8_t* search_input;
+          size_t search_length = max_j - repeat_any_args->min;
+          bool insertion_point_initialized = false;
 
-          const uint8_t* next_input = current->input + j * input_incr;
-
-          // Find the point where next_input should be inserted. The list is
-          // kept sorted by pointer in increasing order, the insertion point is
-          // an item that has a pointer lower or equal than next_input, but
-          // whose next item have a pointer that is larger.
-          while (insertion_point->next != NULL &&
-                 insertion_point->next->input <= next_input)
+          while (literal_count < YR_MAX_ATOM_LENGTH &&
+                 *literal_code == RE_OPCODE_LITERAL)
           {
-            insertion_point = insertion_point->next;
+            literals[literal_count++] = *(literal_code + 1);
+            literal_code += 2;
           }
 
-          // If the input already exists for the next round, we don't need to
-          // insert it.
-          if (insertion_point->round == round + 1 &&
-              insertion_point->input == next_input)
-            continue;
+          if (input_incr > 0)
+          {
+            search_input = current->input + repeat_any_args->min + 1;
+          }
+          else
+          {
+            // Positions are searched in ascending memory order and inserted in
+            // the same order, regardless of the matching direction.
+            search_input = current->input - max_j;
+          }
 
-          // The next opcode is RE_OPCODE_LITERAL, but the literal doesn't
-          // match with the byte at next_input, we don't need to add this
-          // input to the list as we already know that it won't match in the
-          // next round and will be deleted from the list anyways.
-          if (*(next_opcode) == RE_OPCODE_LITERAL &&
-              *(next_opcode + 1) != *next_input)
-            continue;
+          const uint8_t* match_input = search_input;
 
-          RE_FAST_EXEC_POSITION* new_input;
+          while (search_length > 0)
+          {
+            const uint8_t* literal_input = memchr(
+                match_input, *(next_opcode + 1), search_length);
 
-          FAIL_ON_ERROR_WITH_CLEANUP(
-              _yr_re_fast_exec_position_create(
-                  &context->re_fast_exec_position_pool, &new_input),
-              // Cleanup
-              _yr_re_fast_exec_destroy_position_list(
-                  &context->re_fast_exec_position_pool, first, last));
+            if (literal_input == NULL)
+              break;
 
-          new_input->input = next_input;
-          new_input->round = round + 1;
-          new_input->prev = insertion_point;
-          new_input->next = insertion_point->next;
-          insertion_point->next = new_input;
+            bool literal_matches = true;
+            int literal_offset = input_incr > 0
+                                     ? (int) (literal_input - current->input)
+                                     : (int) (current->input - literal_input);
+            int literals_available = max_j - literal_offset;
 
-          if (new_input->next != NULL)
-            new_input->next->prev = new_input;
+            for (int k = 1;
+                 k < literal_count && k <= literals_available;
+                 k++)
+            {
+              if (*(literal_input + k * input_incr) != literals[k])
+              {
+                literal_matches = false;
+                break;
+              }
+            }
 
-          if (insertion_point == last)
-            last = new_input;
+            if (!literal_matches)
+            {
+              search_length -= literal_input - match_input + 1;
+              match_input = literal_input + 1;
+              continue;
+            }
+
+            if (!insertion_point_initialized)
+            {
+              if (input_incr < 0)
+              {
+                insertion_point = current->prev;
+
+                while (insertion_point != NULL &&
+                       insertion_point->input > literal_input)
+                {
+                  insertion_point = insertion_point->prev;
+                }
+              }
+
+              insertion_point_initialized = true;
+            }
+
+            FAIL_ON_ERROR_WITH_CLEANUP(
+                _yr_re_fast_exec_insert_position(
+                    &first,
+                    &last,
+                    &context->re_fast_exec_position_pool,
+                    &insertion_point,
+                    literal_input,
+                    round + 1),
+                // Cleanup
+                _yr_re_fast_exec_destroy_position_list(
+                    &context->re_fast_exec_position_pool, first, last));
+
+            search_length -= literal_input - match_input + 1;
+            match_input = literal_input + 1;
+          }
+        }
+        else
+        {
+          for (int j = repeat_any_args->min + 1; j <= max_j; j++)
+          {
+            const uint8_t* next_input = current->input + j * input_incr;
+
+            // Find the point where next_input should be inserted. The list is
+            // kept sorted by pointer in increasing order, the insertion point is
+            // an item that has a pointer lower or equal than next_input, but
+            // whose next item have a pointer that is larger.
+            while (insertion_point->next != NULL &&
+                   insertion_point->next->input <= next_input)
+            {
+              insertion_point = insertion_point->next;
+            }
+
+            // If the input already exists for the next round, we don't need to
+            // insert it.
+            if (insertion_point->round == round + 1 &&
+                insertion_point->input == next_input)
+              continue;
+
+            // The next opcode is RE_OPCODE_LITERAL, but the literal doesn't
+            // match with the byte at next_input, we don't need to add this
+            // input to the list as we already know that it won't match in the
+            // next round and will be deleted from the list anyways.
+            if (*(next_opcode) == RE_OPCODE_LITERAL &&
+                *(next_opcode + 1) != *next_input)
+              continue;
+
+            RE_FAST_EXEC_POSITION* new_input;
+
+            FAIL_ON_ERROR_WITH_CLEANUP(
+                _yr_re_fast_exec_position_create(
+                    &context->re_fast_exec_position_pool, &new_input),
+                // Cleanup
+                _yr_re_fast_exec_destroy_position_list(
+                    &context->re_fast_exec_position_pool, first, last));
+
+            new_input->input = next_input;
+            new_input->round = round + 1;
+            new_input->prev = insertion_point;
+            new_input->next = insertion_point->next;
+            insertion_point->next = new_input;
+
+            if (new_input->next != NULL)
+              new_input->next->prev = new_input;
+
+            if (insertion_point == last)
+              last = new_input;
+          }
         }
 
         current->input += input_incr * repeat_any_args->min;

@@ -1607,6 +1607,23 @@ static void test_hex_strings()
         condition: $a }",
       "1234567890");
 
+  // Exercise the literal search used after a wide wildcard range. The first
+  // two matches are at the maximum and minimum gap sizes, while the third
+  // prefix is followed by a gap that is too large.
+  assert_true_rule(
+      "rule test { \
+        strings: $a = { 31 32 [0-20] 38 39 } \
+        condition: #a == 2 }",
+      "12XXXXXXXXXXXXXXXXXXXX89|12XXXXXXXXXXXXXXXXXXXXX89|1289");
+
+  // The same case with an atom on the right side of the gap, which exercises
+  // backward matching.
+  assert_true_rule(
+      "rule test { \
+        strings: $a = { 31 32 [0-20] 38 39 30 31 33 } \
+        condition: #a == 2 }",
+      "12XXXXX89013|12XXXXXXXXXXXXXXXXXXXXX89013|1289013");
+
   assert_true_rule(
       "rule test { \
         strings: $a = { 31 32 [0-2] 34 [0-2] 34 } \
@@ -2571,6 +2588,15 @@ void test_re()
   assert_true_regexp("ab*c", "ac", "ac");
   assert_true_regexp("ab*bc", "abc", "abc");
   assert_true_regexp("ab*bc", "abbc", "abbc");
+  assert_true_regexp(
+      "AB.{3,34}X",
+      "AB1234567890123456789012345678901234X",
+      "AB1234567890123456789012345678901234X");
+  assert_false_regexp(
+      "AB.{3,34}X",
+      "AB12345678901234567890123456789012345X");
+  assert_true_regexp("AB.{0,34}X", "AB123X456X", "AB123X456X");
+  assert_true_regexp("AB.{0,34}?X", "AB123X456X", "AB123X");
   assert_true_regexp("a.*bb", "abbbb", "abbbb");
   assert_true_regexp("a.*?bbb", "abbbbbb", "abbb");
   assert_true_regexp("a.*c", "ac", "ac");
